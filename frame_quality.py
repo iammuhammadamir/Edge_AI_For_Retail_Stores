@@ -164,17 +164,30 @@ def score_face_size(bbox: Tuple[int, int, int, int], frame_shape: Tuple[int, int
         Score in [0, 1] range
     """
     x1, y1, x2, y2 = bbox
-    face_area = (x2 - x1) * (y2 - y1)
-    frame_area = frame_shape[0] * frame_shape[1]
+    face_width = x2 - x1
+    face_height = y2 - y1
+    frame_height, frame_width = frame_shape[:2]
     
-    # Face should ideally be 5-30% of frame
-    ratio = face_area / frame_area
+    # Use face width relative to frame width (more intuitive)
+    width_ratio = face_width / frame_width
     
-    # Normalize: 0% -> 0, 15% -> 1, >30% -> 1
-    if ratio < 0.01:
-        return 0.0
-    elif ratio < 0.15:
-        return ratio / 0.15
+    # Load thresholds from config
+    try:
+        import config as cfg
+        MIN_RATIO = cfg.FACE_SIZE_MIN_RATIO
+        GOOD_RATIO = cfg.FACE_SIZE_GOOD_RATIO
+        MIN_SCORE = cfg.FACE_SIZE_MIN_SCORE
+    except (ImportError, AttributeError):
+        MIN_RATIO = 0.02
+        GOOD_RATIO = 0.08
+        MIN_SCORE = 0.4
+    
+    if width_ratio < MIN_RATIO:
+        # Very small face - scale down from MIN_SCORE
+        return MIN_SCORE * (width_ratio / MIN_RATIO)
+    elif width_ratio < GOOD_RATIO:
+        # Decent face - linear scale from MIN_SCORE to 1.0
+        return MIN_SCORE + (1.0 - MIN_SCORE) * ((width_ratio - MIN_RATIO) / (GOOD_RATIO - MIN_RATIO))
     else:
         return 1.0
 

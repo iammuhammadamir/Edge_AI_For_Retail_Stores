@@ -34,12 +34,18 @@ QUALITY_TOP_N_FRAMES: int = 5  # Number of top frames to show in debug output
 QUALITY_IMPORTANCE: dict = {
     'frontality': 8,    # Critical - angled faces match poorly
     'sharpness': 6,     # Important - blur hurts recognition
-    'face_size': 5,     # Moderate - too small/far is bad
+    'face_size': 3,     # Lower - don't penalize distant faces too harshly
     'brightness': 4,    # Some tolerance for lighting variation
     'contrast': 3,      # Lower priority - less critical
 }
 
 QUALITY_BASE_SCORE: float = 1000.0  # Starting score before penalties
+
+# Face size scoring parameters (face width / frame width)
+# Tune these based on your camera distance and setup
+FACE_SIZE_MIN_RATIO: float = 0.02   # Below this = very small face (score ~0.4)
+FACE_SIZE_GOOD_RATIO: float = 0.08  # Above this = perfect score (1.0)
+FACE_SIZE_MIN_SCORE: float = 0.4    # Base score for faces at MIN_RATIO
 
 # =============================================================================
 # RECOGNITION SETTINGS
@@ -57,7 +63,7 @@ COOLDOWN_SECONDS: int = 10  # Wait time before processing next person
 
 # Minimum quality score to proceed with recognition (out of 1000)
 # Frames below this are skipped entirely (saves API calls)
-MIN_QUALITY_SCORE: float = 500.0  # 50% of base score
+MIN_QUALITY_SCORE: float = 350  # 50% of base score
 
 # Minimum InsightFace detection confidence to send to API
 # Lower confidence = less reliable embedding = potential false match
