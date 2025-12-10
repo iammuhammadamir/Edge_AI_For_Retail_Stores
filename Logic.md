@@ -1,131 +1,170 @@
-# Face Detector - Internal Logic
+# Technical Design & Logic
 
-## Overview
+## Frame Quality Scoring System
 
-The system connects to an RTSP camera stream, detects faces, and saves frames when a face is detected.
+### Why Quality Scoring?
+
+The original system used whatever frame triggered detection, which could be:
+- Face at an angle (not frontal)
+- Motion blur
+- Poor lighting
+- Face too small/far
+
+**Solution**: Capture multiple frames after detection, score them, and use the best one.
 
 ---
 
-## Frame Processing Pipeline
+## Quality Metrics
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              MAIN LOOP                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   1. Read frame from RTSP stream (4K: 3840x2160)                            │
-│                     │                                                        │
-│                     ▼                                                        │
-│   2. Skip frame? (process every 5th frame for performance)                  │
-│         │                                                                    │
-│         ├── YES → discard, go to step 1                                     │
-│         │                                                                    │
-│         └── NO ↓                                                            │
-│                                                                              │
-│   3. Resize frame to 1280x720 for processing                                │
-│                     │                                                        │
-│                     ▼                                                        │
-│   4. Run YuNet face detection (~78ms)                                       │
-│                     │                                                        │
-│                     ▼                                                        │
-│   5. Face detected?                                                          │
-│         │                                                                    │
-│         ├── NO → go to step 1                                               │
-│         │                                                                    │
-│         └── YES ↓                                                           │
-│                                                                              │
-│   6. Cooldown active? (5 seconds since last capture)                        │
-│         │                                                                    │
-│         ├── YES → go to step 1 (skip to avoid duplicate captures)           │
-│         │                                                                    │
-│         └── NO ↓                                                            │
-│                                                                              │
-│   7. CAPTURE SESSION:                                                        │
-│      ┌──────────────────────────────────────────────────────────────────┐   │
-│      │  Frame 1: The detection frame itself (GUARANTEED to have face)   │   │
-│      │  Frame 2: Read new frame, wait 300ms                             │   │
-│      │  Frame 3: Read new frame, wait 300ms                             │   │
-│      │  Frame 4: Read new frame, wait 300ms                             │   │
-│      │  Frame 5: Read new frame                                         │   │
-│      └──────────────────────────────────────────────────────────────────┘   │
-│                     │                                                        │
-│                     ▼                                                        │
-│   8. Set cooldown timer, go to step 1                                       │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+### 1. Sharpness (30% weight)
+```python
+# Laplacian variance - higher = sharper
+gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+variance = laplacian.var()
+
+# Score: normalized to 0-1, optimal around variance=500
+score = min(variance / 500, 1.0)
 ```
 
----
+### 2. Frontality (25% weight)
+```python
+# Eye detection + symmetry analysis
+# Uses Haar cascade for eye detection
+# Estimates yaw from eye positions relative to face center
+# Estimates pitch from eye vertical position
 
-## Key Behaviors
+# Fallback: face symmetry (left-right comparison)
+yaw = ((eye_center_x - face_center_x) / face_w) * 60  # degrees
+pitch = ((eye_center_y - expected_eye_y) / face_h) * 50  # degrees
 
-### Frame Skipping
-- Camera streams at ~15 FPS
-- We process every 5th frame → ~3 FPS effective detection rate
-- Skipped frames are discarded (not buffered)
-
-### Face Detection
-- Uses YuNet model (OpenCV built-in)
-- Input: 1280x720 resized frame
-- Output: List of detected face bounding boxes
-- Confidence threshold: 0.7 (70%)
-- Processing time: ~78ms per frame on Jetson Orin Nano
-
-### Capture Session
-- **Frame 1**: The exact frame that triggered detection (guaranteed to contain face)
-- **Frames 2-5**: Subsequent frames read from stream at 300ms intervals
-- All frames resized to 1280x720 before saving
-- Saved as JPEG to `/home/mafiq/zmisc/captures/`
-
-### Cooldown
-- After a capture session, 5-second cooldown before next capture
-- Prevents capturing the same person multiple times as they walk past
-- During cooldown, faces are still detected but no frames are saved
-
----
-
-## Timing Breakdown
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Frame read | ~10-50ms | Depends on network/stream |
-| Resize (4K→720p) | ~5.5ms | CPU-bound |
-| Face detection | ~78ms | YuNet on CPU |
-| **Total per processed frame** | ~85ms | |
-| Effective processing FPS | ~12 FPS | But we only process every 5th frame |
-
-### Response Time (face enters → detection triggers)
-
-Worst case: `stream_latency + frame_skip_wait + detection_time`
-- Stream latency: ~200-500ms (RTSP buffering)
-- Frame skip wait: up to 333ms (5 frames at 15 FPS)
-- Detection time: ~78ms
-
-**Total worst case: ~900ms** from person entering frame to detection trigger.
-
----
-
-## File Naming Convention
-
+# Score: 1.0 for frontal (yaw=0, pitch=0), decreases with angle
+score = max(0, 1.0 - (abs(yaw)/45 + abs(pitch)/30) / 2)
 ```
-session_{YYYYMMDD_HHMMSS}_{session_number}_frame_{N}_{timestamp}.jpg
 
-Example:
-session_20251204_143314_0001_frame_1_20251204_143314_482.jpg
-        └─────────┬────────┘    └─┬─┘ └─────────┬──────────┘
-          session start time   frame#    actual capture time
+### 3. Face Size (15% weight)
+```python
+# Larger faces = better recognition
+face_area = (x2 - x1) * (y2 - y1)
+frame_area = frame_h * frame_w
+ratio = face_area / frame_area
+
+# Score: 1.0 if face is 10%+ of frame
+score = min(ratio / 0.10, 1.0)
+```
+
+### 4. Brightness (15% weight)
+```python
+# Optimal brightness around 127 (middle of 0-255)
+mean_brightness = np.mean(gray_face)
+deviation = abs(mean_brightness - 127) / 127
+
+# Score: 1.0 at optimal, 0.0 at extremes
+score = 1.0 - deviation
+```
+
+### 5. Contrast (15% weight)
+```python
+# Standard deviation of pixel values
+std_dev = np.std(gray_face)
+
+# Score: normalized, optimal around std=50
+score = min(std_dev / 50, 1.0)
 ```
 
 ---
 
-## Configuration (top of face_detector.py)
+## Design Decisions
 
+### Why Haar Cascade for Detection?
+- **Fast**: ~7ms vs ~80ms for InsightFace
+- **Sufficient**: Only need to know IF a face exists, not precise landmarks
+- **Lightweight**: No GPU needed for initial detection
+
+### Why OpenCV for Frontality (not MediaPipe)?
+- **Python 3.13+ compatibility**: MediaPipe doesn't support Python 3.13+
+- **Simpler**: Eye detection + symmetry is sufficient for quality scoring
+- **No extra dependencies**: Uses built-in Haar cascades
+
+### Why 5 Seconds Capture Duration?
+- **Enough variation**: Person likely moves, blinks, changes expression
+- **Not too long**: Don't want to miss next person
+- **Configurable**: `QUALITY_CAPTURE_DURATION_SEC` in `config.py`
+
+### Why Every 3rd Frame?
+- **Reduces processing**: ~50 frames instead of ~150
+- **Still captures variation**: 3 frames apart at 30fps = 100ms apart
+- **Configurable**: `QUALITY_FRAME_SKIP` in `config.py`
+
+---
+
+## Timing Breakdown (Mac M-series)
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| Detection (Haar) | ~7ms | Fast initial check |
+| Frame Capture | ~5000ms | Configurable duration |
+| Quality Scoring | ~260ms | All captured frames |
+| Embedding (InsightFace) | ~40ms | Best frame only |
+| **Total** | ~5.3s | Per person |
+
+---
+
+## Configuration Reference (`config.py`)
+
+### Frame Quality
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QUALITY_CAPTURE_DURATION_SEC` | 5.0 | Capture duration after detection |
+| `QUALITY_FRAME_SKIP` | 3 | Keep every Nth frame |
+| `QUALITY_TOP_N_FRAMES` | 5 | Frames to show in debug report |
+| `QUALITY_WEIGHTS` | dict | Weight for each metric |
+
+### Recognition
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIMILARITY_THRESHOLD` | 0.45 | Cosine similarity for matching |
+| `COOLDOWN_SECONDS` | 10 | Wait between captures |
+| `INSIGHTFACE_MODEL` | "buffalo_s" | Model name (buffalo_s or buffalo_l) |
+
+### Processing
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TARGET_WIDTH` | 1280 | Resize width for processing |
-| `PROCESS_EVERY_N_FRAMES` | 5 | Skip N-1 frames between detections |
-| `DETECTION_CONFIDENCE` | 0.7 | Minimum face detection confidence |
-| `FRAMES_TO_CAPTURE` | 5 | Frames to save per session |
-| `CAPTURE_INTERVAL_MS` | 300 | Delay between captured frames |
-| `COOLDOWN_SECONDS` | 5 | Cooldown between capture sessions |
-| `LOG_LEVEL` | DEBUG | Set to INFO for production |
+| `PROCESS_EVERY_N_FRAMES` | 5 | Skip frames for performance |
+
+### Debug
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEBUG_MODE` | False | Enable debug output |
+| `DEBUG_OUTPUT_DIR` | "debug_output" | Where to save reports |
+| `DEBUG_SAVE_TOP_FRAMES` | True | Save annotated best frames |
+| `DEBUG_GENERATE_REPORT` | True | Generate markdown reports |
+
+---
+
+## Debug Output
+
+When `--debug` flag is used, generates:
+
+```
+debug_output/
+├── debug_20251206_020905.md    # Full report with embedded images
+├── best_20251206_020905.jpg    # Best frame with face box
+├── debug_20251206_020922.md    # Next detection...
+└── best_20251206_020922.jpg
+```
+
+Each report includes:
+- Session metadata (frames captured, faces detected)
+- Best frame score breakdown
+- Top N frames with scores and embedded images
+
+---
+
+## Future Improvements
+
+1. **Multi-person handling**: Queue system for concurrent detections
+2. **GPU acceleration**: Use CUDA on Jetson for faster inference
+3. **Adaptive thresholds**: Adjust based on lighting conditions
+4. **Embedding averaging**: Use multiple frames to create robust embedding

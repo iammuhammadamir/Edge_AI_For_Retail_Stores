@@ -2,7 +2,7 @@
 """
 Face Recognition Module
 Extracts face embeddings and matches against known visitors.
-Uses InsightFace with buffalo_l model (ArcFace).
+Uses InsightFace with buffalo_s/buffalo_l model (ArcFace).
 """
 
 import cv2
@@ -20,17 +20,18 @@ from insightface.app import FaceAnalysis
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (from config.py or defaults)
 # =============================================================================
 
-# Model settings
-MODEL_NAME = "buffalo_s"  # Smaller, faster model. Use "buffalo_l" for better accuracy
-MODEL_DIR = "/home/mafiq/zmisc/models/insightface"
-
-# Matching settings
-SIMILARITY_THRESHOLD = 0.45  # Balanced threshold (0.4-0.5 typical range)
-                              # Lower = more matches (risk: merge different people)
-                              # Higher = fewer matches (risk: same person counted twice)
+try:
+    import config as cfg
+    MODEL_NAME = cfg.INSIGHTFACE_MODEL
+    MODEL_DIR = cfg.MODEL_DIR
+    SIMILARITY_THRESHOLD = cfg.SIMILARITY_THRESHOLD
+except ImportError:
+    MODEL_NAME = "buffalo_s"
+    MODEL_DIR = "/home/mafiq/zmisc/models/insightface"
+    SIMILARITY_THRESHOLD = 0.45
 
 # =============================================================================
 # FACE ANALYZER

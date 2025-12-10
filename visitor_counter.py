@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Visitor Counter - Main Application
-Detects faces, extracts embeddings, matches against known visitors, and counts visits.
+Visitor Counter - Main Application (Server-Side Matching)
+
+Detects faces, captures frames for quality scoring, extracts embeddings,
+and sends to server for identification.
+
+Flow:
+1. Detect face (fast detection)
+2. Capture frames for X seconds
+3. Score frames and select best quality
+4. Extract embedding from best frame
+5. Send embedding to server (server decides new vs returning)
+
+NOTE: No local database - server is the single source of truth.
 """
 
 import cv2
@@ -11,100 +22,284 @@ import sys
 import argparse
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+import numpy as np
 
-import database as db
+import config as cfg
 from face_recognition import (
     extract_embeddings,
-    find_best_match,
     get_face_analyzer,
-    SIMILARITY_THRESHOLD
 )
+from frame_quality import (
+    compute_quality_score,
+    score_frames,
+    get_best_frame,
+    detect_face,
+    QualityScore
+)
+from api_client import ClientBridgeAPI, init_api, get_api
 
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
 
-LOG_LEVEL = logging.DEBUG  # Set to logging.INFO for production
-
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=cfg.LOG_LEVEL,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# CONFIGURATION
+# DATA STRUCTURES
 # =============================================================================
 
-RTSP_URL = "rtsp://admin:SmoothFlow@10.0.0.227:554/h264Preview_01_main"
+@dataclass
+class PersonCapture:
+    """Container for frames captured for a single person."""
+    session_id: str
+    frames: List[np.ndarray]
+    start_time: float
+    trigger_frame: np.ndarray  # The frame that triggered detection
 
-# Processing settings
-TARGET_WIDTH = 1280  # Resize to this width for processing
-PROCESS_EVERY_N_FRAMES = 5  # Process every Nth frame
-
-# Cooldown to avoid counting same person multiple times
-COOLDOWN_SECONDS = 10  # Increased for recognition (person needs to leave frame)
-
-# Output settings
-OUTPUT_DIR = "/home/mafiq/zmisc/visitor_images"
-DEBUG_DIR = "/home/mafiq/zmisc/debug/visitor_counter"
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-def resize_frame(frame, target_width):
+def resize_frame(frame: np.ndarray, target_width: int) -> np.ndarray:
     """Resize frame maintaining aspect ratio."""
     h, w = frame.shape[:2]
     scale = target_width / w
     new_h = int(h * scale)
     return cv2.resize(frame, (target_width, new_h))
 
-def save_visitor_image(frame, visitor_id: int, session_id: str) -> str:
+
+def save_visitor_image(frame: np.ndarray, visitor_id: int, session_id: str) -> str:
     """Save a sample image for a visitor."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{OUTPUT_DIR}/visitor_{visitor_id}_{session_id}_{timestamp}.jpg"
+    filename = f"{cfg.OUTPUT_DIR}/visitor_{visitor_id}_{session_id}_{timestamp}.jpg"
     cv2.imwrite(filename, frame)
     return filename
 
-def save_debug_image(frame, face_results, detection_num, debug_mode):
-    """Save debug image with face boxes if debug mode is enabled."""
-    if not debug_mode:
+
+# =============================================================================
+# FRAME CAPTURE
+# =============================================================================
+
+def capture_frames_for_person(
+    cap: cv2.VideoCapture,
+    trigger_frame: np.ndarray,
+    duration: float,
+    frame_skip: int,
+    target_width: int
+) -> PersonCapture:
+    """
+    Capture frames for a detected person over specified duration.
+    
+    Args:
+        cap: Video capture object
+        trigger_frame: The frame that triggered detection
+        duration: How long to capture (seconds)
+        frame_skip: Keep every Nth frame
+        target_width: Resize frames to this width
+    
+    Returns:
+        PersonCapture with collected frames
+    """
+    session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    frames = [trigger_frame]  # Include the trigger frame
+    frame_count = 0
+    start_time = time.time()
+    
+    logger.debug(f"Capturing frames for {duration}s (every {frame_skip} frame)...")
+    
+    while time.time() - start_time < duration:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_count += 1
+        if frame_count % frame_skip == 0:
+            frame_resized = resize_frame(frame, target_width)
+            frames.append(frame_resized)
+    
+    logger.debug(f"Captured {len(frames)} frames ({frame_count} total, kept every {frame_skip})")
+    
+    return PersonCapture(
+        session_id=session_id,
+        frames=frames,
+        start_time=start_time,
+        trigger_frame=trigger_frame
+    )
+
+
+# =============================================================================
+# QUALITY SCORING & SELECTION
+# =============================================================================
+
+def select_best_frame(capture: PersonCapture) -> Tuple[np.ndarray, QualityScore, List[Tuple[int, np.ndarray, QualityScore]]]:
+    """
+    Score all frames and select the best one.
+    
+    Returns:
+        (best_frame, best_score, all_scored_frames)
+    """
+    scored = score_frames(capture.frames)
+    
+    if not scored:
+        # Fallback to trigger frame if no faces detected in any frame
+        logger.warning("No faces detected in captured frames, using trigger frame")
+        score = compute_quality_score(capture.trigger_frame)
+        if score is None:
+            # Create a minimal score for the trigger frame
+            score = QualityScore(
+                total=0.0, face_size=0.0, sharpness=0.0,
+                brightness=0.0, contrast=0.0, frontality=0.0,
+                yaw=0.0, pitch=0.0, bbox=(0, 0, 0, 0)
+            )
+        return (capture.trigger_frame, score, [])
+    
+    best_idx, best_frame, best_score = scored[0]
+    return (best_frame, best_score, scored)
+
+
+# =============================================================================
+# DEBUG OUTPUT
+# =============================================================================
+
+def image_to_base64(image: np.ndarray, max_width: int = 400) -> str:
+    """Convert image to base64 string for markdown embedding."""
+    h, w = image.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        new_h = int(h * scale)
+        image = cv2.resize(image, (max_width, new_h))
+    
+    _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    b64 = base64.b64encode(buffer).decode('utf-8')
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def draw_face_box(image: np.ndarray, bbox: Tuple[int, int, int, int], score: float) -> np.ndarray:
+    """Draw face bounding box and score on image."""
+    img = image.copy()
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    label = f"Score: {score:.3f}"
+    cv2.putText(img, label, (x1, y1 - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    return img
+
+
+def generate_debug_report(
+    capture: PersonCapture,
+    scored_frames: List[Tuple[int, np.ndarray, QualityScore]],
+    best_score: QualityScore,
+    visitor_result: str,
+    visitor_id: int
+) -> None:
+    """
+    Generate debug.md report with top frames and scores.
+    """
+    if not cfg.DEBUG_MODE or not cfg.DEBUG_GENERATE_REPORT:
         return
     
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    debug_frame = frame.copy()
+    os.makedirs(cfg.DEBUG_OUTPUT_DIR, exist_ok=True)
     
-    for embedding, bbox, det_score in face_results:
-        x1, y1, x2, y2 = bbox.astype(int)
-        cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(debug_frame, f"{det_score:.2f}", (x1, y1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{DEBUG_DIR}/detection_{detection_num:04d}_{timestamp}.jpg"
-    cv2.imwrite(filename, debug_frame)
-    logger.debug(f"Debug image saved: {filename}")
+    md = f"""# Frame Quality Debug Report
+
+**Generated**: {timestamp}  
+**Session ID**: {capture.session_id}  
+**Total Frames Captured**: {len(capture.frames)}  
+**Frames with Faces**: {len(scored_frames)}  
+**Result**: {visitor_result} (Visitor #{visitor_id})
+
+---
+
+## Best Frame Selected
+
+**Total Score: {best_score.total:.3f}**
+
+| Metric | Score | Details |
+|--------|-------|---------|  
+| Sharpness | {best_score.sharpness:.3f} | Laplacian variance |
+| Frontality | {best_score.frontality:.3f} | Yaw: {best_score.yaw:.1f}°, Pitch: {best_score.pitch:.1f}° |
+| Face Size | {best_score.face_size:.3f} | Relative to frame |
+| Brightness | {best_score.brightness:.3f} | Face ROI mean |
+| Contrast | {best_score.contrast:.3f} | Face ROI std dev |
+
+---
+
+## Top {cfg.QUALITY_TOP_N_FRAMES} Frames
+
+"""
+    
+    for rank, (frame_idx, frame, score) in enumerate(scored_frames[:cfg.QUALITY_TOP_N_FRAMES], 1):
+        annotated = draw_face_box(frame, score.bbox, score.total)
+        b64_img = image_to_base64(annotated)
+        
+        md += f"""### Rank #{rank} (Frame {frame_idx})
+
+**Score: {score.total:.3f}** | Sharp: {score.sharpness:.2f} | Frontal: {score.frontality:.2f} | Yaw: {score.yaw:.1f}° | Pitch: {score.pitch:.1f}°
+
+![Frame {frame_idx}]({b64_img})
+
+---
+
+"""
+    
+    # Save report
+    report_path = os.path.join(cfg.DEBUG_OUTPUT_DIR, f"debug_{capture.session_id}.md")
+    with open(report_path, 'w') as f:
+        f.write(md)
+    
+    logger.debug(f"Debug report saved: {report_path}")
+    
+    # Also save best frame as image
+    if cfg.DEBUG_SAVE_TOP_FRAMES and scored_frames:
+        best_frame = scored_frames[0][1]
+        best_annotated = draw_face_box(best_frame, best_score.bbox, best_score.total)
+        best_path = os.path.join(cfg.DEBUG_OUTPUT_DIR, f"best_{capture.session_id}.jpg")
+        cv2.imwrite(best_path, best_annotated)
+        logger.debug(f"Best frame saved: {best_path}")
 
 # =============================================================================
 # MAIN LOOP
 # =============================================================================
 
-def run_visitor_counter(debug_mode=False):
-    """Main visitor counting loop."""
+def run_visitor_counter(debug_mode: bool = False) -> None:
+    """
+    Main visitor counting loop with frame quality scoring.
     
-    # Initialize database
-    db.init_db()
+    Flow:
+    1. Fast face detection (Haar cascade)
+    2. On detection: capture frames for QUALITY_CAPTURE_DURATION_SEC
+    3. Score frames and select best quality
+    4. Extract embedding from best frame (InsightFace)
+    5. Match against known visitors or enroll new
+    """
+    
+    # Override debug mode from config if passed as argument
+    if debug_mode:
+        cfg.DEBUG_MODE = True
+    
+    # Get camera URL (handle int for webcam)
+    camera_source = cfg.RTSP_URL
+    camera_display = str(camera_source) if isinstance(camera_source, int) else camera_source.split('@')[-1]
     
     logger.info("=" * 70)
-    logger.info("VISITOR COUNTER")
+    logger.info("VISITOR COUNTER (with Frame Quality Scoring)")
     logger.info("=" * 70)
-    logger.info(f"RTSP: {RTSP_URL.split('@')[1]}")
-    logger.info(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
-    logger.info(f"Cooldown: {COOLDOWN_SECONDS}s")
+    logger.info(f"Camera: {camera_display}")
+    logger.info(f"Similarity threshold: {cfg.SIMILARITY_THRESHOLD}")
+    logger.info(f"Cooldown: {cfg.COOLDOWN_SECONDS}s")
+    logger.info(f"Quality capture: {cfg.QUALITY_CAPTURE_DURATION_SEC}s, every {cfg.QUALITY_FRAME_SKIP} frame")
+    logger.info(f"Debug mode: {cfg.DEBUG_MODE}")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 70)
     
@@ -112,14 +307,22 @@ def run_visitor_counter(debug_mode=False):
     logger.info("Loading face recognition model...")
     get_face_analyzer()
     
-    # Load existing visitor embeddings into memory
-    logger.info("Loading known visitors from database...")
-    known_embeddings = db.get_all_embeddings()
-    logger.info(f"Loaded {len(known_embeddings)} known visitor(s)")
+    # Initialize API client (required for server-side matching)
+    logger.info(f"Connecting to API: {cfg.API_BASE_URL}")
+    api = init_api(
+        base_url=cfg.API_BASE_URL,
+        api_key=cfg.API_KEY,
+        location_id=cfg.API_LOCATION_ID
+    )
+    if api.health_check():
+        logger.info("✓ API connection successful")
+    else:
+        logger.error("✗ API not reachable - cannot continue without server")
+        return
     
     # Connect to camera
     logger.info("Connecting to camera...")
-    cap = cv2.VideoCapture(RTSP_URL)
+    cap = cv2.VideoCapture(camera_source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     if not cap.isOpened():
@@ -131,7 +334,7 @@ def run_visitor_counter(debug_mode=False):
         logger.error("Cannot read from camera")
         return
     
-    frame_resized = resize_frame(frame, TARGET_WIDTH)
+    frame_resized = resize_frame(frame, cfg.TARGET_WIDTH)
     h, w = frame_resized.shape[:2]
     logger.info(f"Original resolution: {frame.shape[1]}x{frame.shape[0]}")
     logger.info(f"Processing resolution: {w}x{h}")
@@ -142,14 +345,16 @@ def run_visitor_counter(debug_mode=False):
     last_capture_time = 0
     
     # Timing stats
-    timing_stats = {'resize': [], 'recognition': [], 'total': []}
+    timing_stats = {'detection': [], 'capture': [], 'scoring': [], 'recognition': [], 'total': []}
     stats_window = 100
     
     # Session stats
     session_stats = {
         'new_visitors': 0,
         'returning_visitors': 0,
-        'total_detections': 0
+        'total_detections': 0,
+        'frames_captured': 0,
+        'frames_scored': 0
     }
     
     try:
@@ -159,94 +364,132 @@ def run_visitor_counter(debug_mode=False):
                 logger.warning("Lost connection. Reconnecting...")
                 cap.release()
                 time.sleep(2)
-                cap = cv2.VideoCapture(RTSP_URL)
+                cap = cv2.VideoCapture(camera_source)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 continue
             
             frame_count += 1
             
             # Skip frames for performance
-            if frame_count % PROCESS_EVERY_N_FRAMES != 0:
+            if frame_count % cfg.PROCESS_EVERY_N_FRAMES != 0:
                 continue
             
             # Check cooldown BEFORE processing
             current_time = time.time()
-            if current_time - last_capture_time < COOLDOWN_SECONDS:
+            if current_time - last_capture_time < cfg.COOLDOWN_SECONDS:
                 continue
             
-            loop_start = time.perf_counter()
-            
             # Resize for processing
-            t0 = time.perf_counter()
-            frame_resized = resize_frame(frame, TARGET_WIDTH)
-            resize_time = (time.perf_counter() - t0) * 1000
+            frame_resized = resize_frame(frame, cfg.TARGET_WIDTH)
             
-            # Extract face embeddings (detection + recognition in one step)
+            # =================================================================
+            # PHASE 1: Fast face detection (Haar cascade)
+            # =================================================================
             t0 = time.perf_counter()
-            face_results = extract_embeddings(frame_resized)
+            face_bbox = detect_face(frame_resized)
+            detection_time = (time.perf_counter() - t0) * 1000
+            timing_stats['detection'].append(detection_time)
+            
+            if face_bbox is None:
+                continue  # No face detected, keep scanning
+            
+            logger.info(f"Face detected! Starting capture...")
+            session_stats['total_detections'] += 1
+            
+            # =================================================================
+            # PHASE 2: Capture frames for quality scoring
+            # =================================================================
+            t0 = time.perf_counter()
+            capture = capture_frames_for_person(
+                cap=cap,
+                trigger_frame=frame_resized,
+                duration=cfg.QUALITY_CAPTURE_DURATION_SEC,
+                frame_skip=cfg.QUALITY_FRAME_SKIP,
+                target_width=cfg.TARGET_WIDTH
+            )
+            capture_time = (time.perf_counter() - t0) * 1000
+            timing_stats['capture'].append(capture_time)
+            session_stats['frames_captured'] += len(capture.frames)
+            
+            # =================================================================
+            # PHASE 3: Score frames and select best
+            # =================================================================
+            t0 = time.perf_counter()
+            best_frame, best_score, scored_frames = select_best_frame(capture)
+            scoring_time = (time.perf_counter() - t0) * 1000
+            timing_stats['scoring'].append(scoring_time)
+            session_stats['frames_scored'] += len(scored_frames)
+            
+            logger.info(f"Best frame score: {best_score.total:.3f} "
+                        f"(sharp={best_score.sharpness:.2f}, frontal={best_score.frontality:.2f}, "
+                        f"yaw={best_score.yaw:.1f}°, pitch={best_score.pitch:.1f}°)")
+            
+            # =================================================================
+            # PHASE 4: Extract embedding from best frame
+            # =================================================================
+            t0 = time.perf_counter()
+            face_results = extract_embeddings(best_frame)
             recognition_time = (time.perf_counter() - t0) * 1000
-            
-            total_time = (time.perf_counter() - loop_start) * 1000
-            
-            # Store timing stats
-            timing_stats['resize'].append(resize_time)
             timing_stats['recognition'].append(recognition_time)
+            
+            if not face_results:
+                logger.warning("No face found in best frame for embedding extraction")
+                last_capture_time = time.time()
+                continue
+            
+            # Use the first (best) face result
+            embedding, bbox, det_score = face_results[0]
+            
+            # =================================================================
+            # PHASE 5: Send to server for identification
+            # =================================================================
+            # Server performs matching and decides new vs returning
+            api_response = api.identify(embedding, best_frame)
+            
+            if api_response.success:
+                visitor_id = api_response.customer_id
+                
+                if api_response.status == "returning":
+                    visitor_result = "RETURNING"
+                    logger.info(f"  → RETURNING visitor #{visitor_id} "
+                               f"(similarity: {api_response.similarity:.3f}, "
+                               f"visit #{api_response.visit_count})")
+                    session_stats['returning_visitors'] += 1
+                else:
+                    visitor_result = "NEW"
+                    logger.info(f"  → NEW visitor #{visitor_id} enrolled")
+                    session_stats['new_visitors'] += 1
+            else:
+                visitor_result = "ERROR"
+                visitor_id = 0
+                logger.error(f"  → API error: {api_response.message}")
+            
+            # =================================================================
+            # DEBUG: Generate report if enabled
+            # =================================================================
+            generate_debug_report(
+                capture=capture,
+                scored_frames=scored_frames,
+                best_score=best_score,
+                visitor_result=visitor_result,
+                visitor_id=visitor_id
+            )
+            
+            # Update cooldown
+            last_capture_time = time.time()
+            
+            # Calculate total time for this detection
+            total_time = detection_time + capture_time + scoring_time + recognition_time
             timing_stats['total'].append(total_time)
+            
+            # Trim timing stats
             for key in timing_stats:
                 if len(timing_stats[key]) > stats_window:
                     timing_stats[key] = timing_stats[key][-stats_window:]
             
-            # Process each detected face
-            if face_results:
-                session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                # Save debug image if enabled
-                save_debug_image(frame_resized, face_results, session_stats['total_detections'] + 1, debug_mode)
-                
-                for i, (embedding, bbox, det_score) in enumerate(face_results):
-                    session_stats['total_detections'] += 1
-                    
-                    logger.info(f"Face detected (confidence: {det_score:.2f})")
-                    
-                    # Try to match against known visitors
-                    match = find_best_match(embedding, known_embeddings)
-                    
-                    if match:
-                        visitor_id, similarity = match
-                        logger.info(f"  → RETURNING visitor #{visitor_id} (similarity: {similarity:.3f})")
-                        
-                        # Record the visit
-                        db.record_visit(visitor_id, session_id, similarity)
-                        session_stats['returning_visitors'] += 1
-                        
-                    else:
-                        # New visitor - add to database
-                        image_path = save_visitor_image(frame_resized, 0, session_id)  # temp id
-                        visitor_id = db.add_visitor(embedding, image_path)
-                        
-                        # Rename image with correct visitor ID
-                        new_path = image_path.replace("visitor_0_", f"visitor_{visitor_id}_")
-                        os.rename(image_path, new_path)
-                        
-                        # Add to in-memory cache
-                        known_embeddings.append((visitor_id, embedding))
-                        
-                        logger.info(f"  → NEW visitor #{visitor_id} enrolled")
-                        session_stats['new_visitors'] += 1
-                    
-                    # Update cooldown
-                    last_capture_time = time.time()
-                
-                # Log current stats
-                logger.debug(f"  DB: {db.get_visitor_count()} unique visitors")
-            
-            # Progress indicator with timing stats
-            if (frame_count // PROCESS_EVERY_N_FRAMES) % 100 == 0:
-                avg_resize = sum(timing_stats['resize']) / len(timing_stats['resize'])
-                avg_recog = sum(timing_stats['recognition']) / len(timing_stats['recognition'])
-                avg_total = sum(timing_stats['total']) / len(timing_stats['total'])
-                
-                logger.debug(f"[PERF] Resize: {avg_resize:.1f}ms | Recognition: {avg_recog:.1f}ms | Total: {avg_total:.1f}ms")
+            # Log current stats
+            logger.debug(f"  Timing: detect={detection_time:.0f}ms, capture={capture_time:.0f}ms, "
+                        f"score={scoring_time:.0f}ms, recog={recognition_time:.0f}ms")
                 
     except KeyboardInterrupt:
         logger.info("\nStopping visitor counter...")
@@ -260,21 +503,31 @@ def run_visitor_counter(debug_mode=False):
         logger.info(f"Total face detections: {session_stats['total_detections']}")
         logger.info(f"New visitors enrolled: {session_stats['new_visitors']}")
         logger.info(f"Returning visitors:    {session_stats['returning_visitors']}")
+        logger.info(f"Frames captured:       {session_stats['frames_captured']}")
+        logger.info(f"Frames scored:         {session_stats['frames_scored']}")
         
-        logger.info(f"\nUnique visitors in DB: {db.get_visitor_count()}")
+        total_visitors = session_stats['new_visitors'] + session_stats['returning_visitors']
+        logger.info(f"\nTotal visitors this session: {total_visitors}")
         
-        if timing_stats['recognition']:
+        if timing_stats['total']:
             logger.info("\nTIMING (averages):")
-            logger.info(f"  Resize:      {sum(timing_stats['resize'])/len(timing_stats['resize']):.1f} ms")
-            logger.info(f"  Recognition: {sum(timing_stats['recognition'])/len(timing_stats['recognition']):.1f} ms")
-            logger.info(f"  Total:       {sum(timing_stats['total'])/len(timing_stats['total']):.1f} ms")
+            for key in ['detection', 'capture', 'scoring', 'recognition', 'total']:
+                if timing_stats[key]:
+                    avg = sum(timing_stats[key]) / len(timing_stats[key])
+                    logger.info(f"  {key.capitalize():12}: {avg:.1f} ms")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visitor Counter")
-    parser.add_argument("--debug", action="store_true", help="Save debug images with face boxes")
+    parser = argparse.ArgumentParser(description="Visitor Counter with Frame Quality Scoring")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (save reports and images)")
+    parser.add_argument("--webcam", action="store_true", help="Use webcam (camera 0) instead of RTSP")
     args = parser.parse_args()
     
+    if args.webcam:
+        cfg.RTSP_URL = 0
+        logger.info("Using webcam (camera 0)")
+    
     if args.debug:
-        logger.info(f"Debug mode: saving images to {DEBUG_DIR}")
+        cfg.DEBUG_MODE = True
+        logger.info(f"Debug mode enabled: saving to {cfg.DEBUG_OUTPUT_DIR}")
     
     run_visitor_counter(debug_mode=args.debug)
