@@ -15,6 +15,7 @@ models/
 
 # Debug/output folders
 debug/
+debug_output/
 recordings/
 captures/
 visitor_images/

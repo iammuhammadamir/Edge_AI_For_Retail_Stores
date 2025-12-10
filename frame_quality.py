@@ -45,56 +45,110 @@ class QualityScore:
 
 
 # =============================================================================
-# FACE DETECTION (Simple Haar Cascade for standalone testing)
+# FACE DETECTION (YuNet - modern, lightweight, accurate)
 # =============================================================================
 
-_face_cascade = None
-_eye_cascade = None
+_yunet_detector = None
+_yunet_input_size = None
 
-def get_face_detector():
-    """Get or initialize face detector (Haar Cascade for simplicity)."""
-    global _face_cascade
-    if _face_cascade is None:
-        _face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+def get_yunet_detector(input_size: Tuple[int, int] = (640, 480)):
+    """
+    Get or initialize YuNet face detector.
+    
+    YuNet is a modern lightweight face detector included in OpenCV 4.5+.
+    Much more accurate than Haar Cascade while still being fast (~5-10ms).
+    
+    Args:
+        input_size: (width, height) of input frames
+    """
+    global _yunet_detector, _yunet_input_size
+    
+    # Reinitialize if input size changed
+    if _yunet_detector is None or _yunet_input_size != input_size:
+        # YuNet model path - download if not exists
+        import os
+        model_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(model_dir, "models", "face_detection_yunet_2023mar.onnx")
+        
+        # Download model if not exists
+        if not os.path.exists(model_path):
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            import urllib.request
+            url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+            print(f"Downloading YuNet model to {model_path}...")
+            urllib.request.urlretrieve(url, model_path)
+            print("YuNet model downloaded.")
+        
+        _yunet_detector = cv2.FaceDetectorYN.create(
+            model_path,
+            "",
+            input_size,
+            score_threshold=0.5,
+            nms_threshold=0.3,
+            top_k=5000
         )
-    return _face_cascade
-
-
-def get_eye_detector():
-    """Get or initialize eye detector for frontality estimation."""
-    global _eye_cascade
-    if _eye_cascade is None:
-        _eye_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_eye.xml'
-        )
-    return _eye_cascade
+        _yunet_input_size = input_size
+    
+    return _yunet_detector
 
 
 def detect_face(frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     """
-    Detect the largest face in frame.
+    Detect the largest face in frame using YuNet.
     
     Returns:
         (x1, y1, x2, y2) bounding box or None if no face found
     """
-    detector = get_face_detector()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = frame.shape[:2]
+    detector = get_yunet_detector((w, h))
     
-    faces = detector.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60)
-    )
+    # YuNet expects BGR image
+    _, faces = detector.detect(frame)
     
-    if len(faces) == 0:
+    if faces is None or len(faces) == 0:
         return None
     
-    # Return largest face
+    # faces format: [x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rcm, y_rcm, x_lcm, y_lcm, score]
+    # Return largest face by area
     largest = max(faces, key=lambda f: f[2] * f[3])
-    x, y, w, h = largest
-    return (x, y, x + w, y + h)
+    x, y, fw, fh = int(largest[0]), int(largest[1]), int(largest[2]), int(largest[3])
+    return (x, y, x + fw, y + fh)
+
+
+def detect_face_with_landmarks(frame: np.ndarray) -> Optional[Tuple[Tuple[int, int, int, int], dict]]:
+    """
+    Detect face and return landmarks from YuNet.
+    
+    Returns:
+        ((x1, y1, x2, y2), landmarks_dict) or None if no face found
+        landmarks_dict contains: right_eye, left_eye, nose, right_mouth, left_mouth
+    """
+    h, w = frame.shape[:2]
+    detector = get_yunet_detector((w, h))
+    
+    _, faces = detector.detect(frame)
+    
+    if faces is None or len(faces) == 0:
+        return None
+    
+    # Get largest face
+    largest = max(faces, key=lambda f: f[2] * f[3])
+    
+    # Parse YuNet output
+    # Format: [x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rcm, y_rcm, x_lcm, y_lcm, score]
+    x, y, fw, fh = int(largest[0]), int(largest[1]), int(largest[2]), int(largest[3])
+    bbox = (x, y, x + fw, y + fh)
+    
+    landmarks = {
+        'right_eye': (float(largest[4]), float(largest[5])),
+        'left_eye': (float(largest[6]), float(largest[7])),
+        'nose': (float(largest[8]), float(largest[9])),
+        'right_mouth': (float(largest[10]), float(largest[11])),
+        'left_mouth': (float(largest[12]), float(largest[13])),
+        'score': float(largest[14])
+    }
+    
+    return (bbox, landmarks)
 
 
 # =============================================================================
@@ -184,91 +238,70 @@ def score_contrast(face_roi: np.ndarray) -> float:
     return score
 
 
-def estimate_head_pose(frame: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Optional[Tuple[float, float]]:
+def estimate_head_pose_from_landmarks(landmarks: dict, bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
     """
-    Estimate head pose (yaw, pitch) using eye detection and face geometry.
+    Estimate head pose from pre-computed YuNet landmarks.
     
-    This is a lightweight approach using OpenCV's Haar cascades:
-    - Yaw: Estimated from eye positions relative to face center
-    - Pitch: Estimated from eye vertical position in face bbox
+    Args:
+        landmarks: Dict with right_eye, left_eye, nose positions
+        bbox: (x1, y1, x2, y2) face bounding box
     
     Returns:
-        (yaw, pitch) in degrees, or None if eyes not detected
+        (yaw, pitch) in degrees
     """
-    x1, y1, x2, y2 = face_bbox
-    face_roi = frame[y1:y2, x1:x2]
-    
-    if face_roi.size == 0:
-        return None
-    
-    gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+    x1, y1, x2, y2 = bbox
     face_w = x2 - x1
     face_h = y2 - y1
     
-    # Detect eyes within face region
-    eye_detector = get_eye_detector()
-    eyes = eye_detector.detectMultiScale(
-        gray_roi,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(int(face_w * 0.1), int(face_h * 0.05)),
-        maxSize=(int(face_w * 0.5), int(face_h * 0.4))
-    )
+    right_eye = landmarks['right_eye']
+    left_eye = landmarks['left_eye']
+    nose = landmarks['nose']
     
-    # Filter eyes to only those in upper half of face
-    upper_eyes = [e for e in eyes if e[1] < face_h * 0.5]
+    # Eye center
+    eye_center_x = (left_eye[0] + right_eye[0]) / 2
+    eye_center_y = (left_eye[1] + right_eye[1]) / 2
     
-    if len(upper_eyes) < 2:
-        # Can't estimate pose without both eyes
-        # But we can still give a score based on face symmetry
-        return estimate_pose_from_symmetry(gray_roi)
-    
-    # Sort eyes by x position (left to right)
-    upper_eyes = sorted(upper_eyes, key=lambda e: e[0])
-    
-    # Take the two most separated eyes (likely left and right)
-    if len(upper_eyes) > 2:
-        # Find pair with maximum horizontal separation
-        max_sep = 0
-        best_pair = (upper_eyes[0], upper_eyes[1])
-        for i in range(len(upper_eyes)):
-            for j in range(i+1, len(upper_eyes)):
-                sep = abs(upper_eyes[j][0] - upper_eyes[i][0])
-                if sep > max_sep:
-                    max_sep = sep
-                    best_pair = (upper_eyes[i], upper_eyes[j])
-        left_eye, right_eye = best_pair
-    else:
-        left_eye, right_eye = upper_eyes[0], upper_eyes[1]
-    
-    # Eye centers
-    left_center_x = left_eye[0] + left_eye[2] / 2
-    left_center_y = left_eye[1] + left_eye[3] / 2
-    right_center_x = right_eye[0] + right_eye[2] / 2
-    right_center_y = right_eye[1] + right_eye[3] / 2
-    
-    # Compute yaw from eye positions
-    # If face is frontal, eyes should be symmetric around face center
-    eye_center_x = (left_center_x + right_center_x) / 2
-    face_center_x = face_w / 2
+    # Face center
+    face_center_x = (x1 + x2) / 2
     
     # Yaw: deviation of eye center from face center
-    # Normalized by face width, scaled to degrees
     yaw = ((eye_center_x - face_center_x) / face_w) * 60
     
-    # Compute pitch from eye vertical position
-    # Eyes should be at ~30-35% from top of face bbox for frontal
-    eye_center_y = (left_center_y + right_center_y) / 2
-    expected_eye_y = face_h * 0.32  # Expected position for frontal face
+    # Pitch: estimated from nose position relative to eyes
+    eye_to_nose_y = nose[1] - eye_center_y
+    expected_eye_nose_dist = face_h * 0.25
+    pitch = ((eye_to_nose_y - expected_eye_nose_dist) / face_h) * 40
     
-    # Pitch: deviation from expected eye position
-    pitch = ((eye_center_y - expected_eye_y) / face_h) * 50
-    
-    # Also check eye level (roll indicator, but affects frontality)
-    eye_slope = (right_center_y - left_center_y) / max(right_center_x - left_center_x, 1)
-    roll_penalty = abs(eye_slope) * 20  # Add to pitch as penalty
+    # Roll penalty from eye slope
+    eye_slope = (right_eye[1] - left_eye[1]) / max(abs(right_eye[0] - left_eye[0]), 1)
+    roll_penalty = abs(eye_slope) * 15
     
     return (yaw, pitch + roll_penalty * 0.3)
+
+
+def estimate_head_pose(frame: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Optional[Tuple[float, float]]:
+    """
+    Estimate head pose (yaw, pitch) using YuNet landmarks.
+    
+    Note: This runs detection again. For batch processing, use 
+    estimate_head_pose_from_landmarks() with pre-computed landmarks.
+    
+    Returns:
+        (yaw, pitch) in degrees, or None if landmarks not detected
+    """
+    result = detect_face_with_landmarks(frame)
+    
+    if result is None:
+        # Fallback to symmetry-based estimation
+        x1, y1, x2, y2 = face_bbox
+        face_roi = frame[y1:y2, x1:x2]
+        if face_roi.size == 0:
+            return (0.0, 0.0)
+        gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+        return estimate_pose_from_symmetry(gray_roi)
+    
+    bbox, landmarks = result
+    return estimate_head_pose_from_landmarks(landmarks, bbox)
 
 
 def estimate_pose_from_symmetry(gray_face: np.ndarray) -> Tuple[float, float]:
@@ -330,39 +363,86 @@ def score_frontality(yaw: float, pitch: float) -> float:
 
 
 # =============================================================================
-# MAIN SCORING FUNCTION
+# MULTIPLICATIVE SCORING SYSTEM
 # =============================================================================
+
+def apply_penalty(score: float, factor_value: float, importance: float) -> float:
+    """
+    Apply multiplicative penalty based on factor quality.
+    
+    Formula: score × factor_value^(importance/5)
+    
+    Args:
+        score: Current score (e.g., 1000)
+        factor_value: Quality of this factor (0-1, where 1 is perfect)
+        importance: How much this factor matters (0-10 scale)
+                   0 = factor ignored (multiplier = 1.0)
+                   5 = linear penalty (multiplier = factor_value)
+                   10 = quadratic penalty (multiplier = factor_value²)
+    
+    Returns:
+        Adjusted score
+    """
+    if importance == 0:
+        return score
+    
+    # Clamp factor_value to avoid math errors
+    factor_value = max(0.001, min(1.0, factor_value))
+    
+    # Calculate multiplier: factor^(importance/5)
+    exponent = importance / 5.0
+    multiplier = factor_value ** exponent
+    
+    return score * multiplier
+
 
 def compute_quality_score(
     frame: np.ndarray,
     bbox: Optional[Tuple[int, int, int, int]] = None,
-    weights: Dict[str, float] = None
+    importance: Dict[str, float] = None,
+    base_score: float = None
 ) -> Optional[QualityScore]:
     """
-    Compute overall quality score for a frame.
+    Compute overall quality score for a frame using multiplicative penalties.
+    
+    Each factor independently impacts the score:
+    score = base_score × f1^(imp1/5) × f2^(imp2/5) × ...
     
     Args:
         frame: BGR image
         bbox: Optional face bounding box. If None, will detect face.
-        weights: Optional custom weights for each metric
+        importance: Importance values for each metric (0-10 scale)
+        base_score: Starting score before penalties (default 1000)
     
     Returns:
         QualityScore object or None if no face found
     """
-    if weights is None:
-        weights = {
-            'face_size': 0.15,
-            'sharpness': 0.30,  # Important for recognition
-            'brightness': 0.15,
-            'contrast': 0.15,
-            'frontality': 0.25  # Very important - frontal faces match better
-        }
+    # Import config for defaults
+    try:
+        import config as cfg
+        if importance is None:
+            importance = cfg.QUALITY_IMPORTANCE
+        if base_score is None:
+            base_score = cfg.QUALITY_BASE_SCORE
+    except ImportError:
+        if importance is None:
+            importance = {
+                'frontality': 8,
+                'sharpness': 6,
+                'face_size': 5,
+                'brightness': 4,
+                'contrast': 3,
+            }
+        if base_score is None:
+            base_score = 1000.0
     
-    # Detect face if bbox not provided
+    # Detect face with landmarks (single detection for both bbox and pose)
+    landmarks = None
     if bbox is None:
-        bbox = detect_face(frame)
-        if bbox is None:
+        result = detect_face_with_landmarks(frame)
+        if result is None:
             return None
+        bbox, landmarks = result
     
     x1, y1, x2, y2 = bbox
     
@@ -380,30 +460,32 @@ def compute_quality_score(
     if face_roi.size == 0:
         return None
     
-    # Compute individual scores
+    # Compute individual factor scores (all 0-1 range)
     size_score = score_face_size(bbox, frame.shape[:2])
     sharp_score = score_sharpness(face_roi)
     bright_score = score_brightness(face_roi)
     contrast_score = score_contrast(face_roi)
     
-    # Compute head pose for frontality
-    pose = estimate_head_pose(frame, bbox)
-    if pose is not None:
-        yaw, pitch = pose
+    # Compute head pose for frontality (use cached landmarks if available)
+    if landmarks is not None:
+        yaw, pitch = estimate_head_pose_from_landmarks(landmarks, bbox)
         frontal_score = score_frontality(yaw, pitch)
     else:
-        # If pose estimation fails, assume neutral
-        yaw, pitch = 0.0, 0.0
-        frontal_score = 0.5  # Uncertain, give middle score
+        pose = estimate_head_pose(frame, bbox)
+        if pose is not None:
+            yaw, pitch = pose
+            frontal_score = score_frontality(yaw, pitch)
+        else:
+            yaw, pitch = 0.0, 0.0
+            frontal_score = 0.5
     
-    # Weighted total
-    total = (
-        weights['face_size'] * size_score +
-        weights['sharpness'] * sharp_score +
-        weights['brightness'] * bright_score +
-        weights['contrast'] * contrast_score +
-        weights['frontality'] * frontal_score
-    )
+    # Apply multiplicative penalties
+    total = base_score
+    total = apply_penalty(total, frontal_score, importance.get('frontality', 8))
+    total = apply_penalty(total, sharp_score, importance.get('sharpness', 6))
+    total = apply_penalty(total, size_score, importance.get('face_size', 5))
+    total = apply_penalty(total, bright_score, importance.get('brightness', 4))
+    total = apply_penalty(total, contrast_score, importance.get('contrast', 3))
     
     return QualityScore(
         total=total,

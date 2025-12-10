@@ -104,6 +104,24 @@ COOLDOWN_SECONDS = 10            # Wait between captures (same person)
 QUALITY_CAPTURE_DURATION_SEC = 5.0  # How long to capture frames
 ```
 
+### Quality Scoring (Multiplicative Penalty System)
+```python
+QUALITY_IMPORTANCE = {
+    'frontality': 8,    # Critical - angled faces match poorly
+    'sharpness': 6,     # Important - blur hurts recognition
+    'face_size': 5,     # Moderate - too small/far is bad
+    'brightness': 4,    # Some tolerance for lighting variation
+    'contrast': 3,      # Lower priority - less critical
+}
+QUALITY_BASE_SCORE = 1000.0      # Starting score before penalties
+```
+
+### Quality Gate Thresholds (False Positive Prevention)
+```python
+MIN_QUALITY_SCORE = 500          # Skip recognition if score below this (out of 1000)
+MIN_DETECTION_SCORE = 0.70       # Skip API call if InsightFace confidence below this
+```
+
 ### Model Settings
 ```python
 INSIGHTFACE_MODEL = "buffalo_s"  # "buffalo_s" (fast) or "buffalo_l" (accurate)
@@ -154,8 +172,8 @@ python visitor_counter.py --webcam --debug
 ## Processing Flow (Detailed)
 
 ### Phase 1: Face Detection (~5-10ms)
-- Uses **Haar Cascade** for fast initial detection
-- Only triggers when face is present
+- Uses **YuNet** (modern CNN-based detector from OpenCV Zoo)
+- Much more accurate than legacy Haar Cascade
 - Runs on every 5th frame (~3 FPS)
 
 ### Phase 2: Frame Capture (~5000ms)
@@ -163,19 +181,32 @@ python visitor_counter.py --webcam --debug
 - Keeps every 3rd frame (~50 frames total)
 - Gives time for person to look at camera
 
-### Phase 3: Quality Scoring (~300-500ms)
-- Scores each frame on multiple metrics:
-  - **Sharpness (30%)**: Laplacian variance
-  - **Frontality (25%)**: Yaw/pitch angles
-  - **Face Size (15%)**: Larger = better
-  - **Brightness (15%)**: Not too dark/bright
-  - **Contrast (15%)**: Good feature visibility
-- Selects best frame for recognition
+### Phase 3: Quality Scoring (~2000-3000ms)
+- **Multiplicative penalty system** - each factor independently impacts score
+- Formula: `score = 1000 × f1^(imp1/5) × f2^(imp2/5) × ...`
+- Factors and default importance (0-10 scale):
+  - **Frontality (8)**: Yaw/pitch angles - critical for matching
+  - **Sharpness (6)**: Laplacian variance - blur hurts recognition
+  - **Face Size (5)**: Larger = better
+  - **Brightness (4)**: Not too dark/bright
+  - **Contrast (3)**: Good feature visibility
+- Higher importance = steeper penalty for poor values
+- A single bad factor can kill the score (unlike weighted average)
+
+### Quality Gate 1: Minimum Quality Score
+- **Threshold**: 500/1000
+- If best frame score < 500, skip recognition entirely
+- Prevents wasting API calls on poor captures (angled faces, far away, etc.)
 
 ### Phase 4: Embedding Extraction (~50-100ms)
 - Uses **InsightFace buffalo_s** model
 - Extracts 512-dimensional face embedding
-- Normalized vector for cosine similarity
+- Returns detection confidence score
+
+### Quality Gate 2: Detection Confidence
+- **Threshold**: 0.70
+- If InsightFace detection confidence < 0.70, skip API call
+- Prevents false enrollments from unreliable embeddings
 
 ### Phase 5: Server Identification (~500-1000ms)
 - POST to `/api/edge/identify`

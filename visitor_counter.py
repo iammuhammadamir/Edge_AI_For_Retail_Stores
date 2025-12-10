@@ -21,6 +21,7 @@ import os
 import sys
 import argparse
 import logging
+import base64
 from datetime import datetime
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
@@ -223,15 +224,17 @@ def generate_debug_report(
 
 ## Best Frame Selected
 
-**Total Score: {best_score.total:.3f}**
+**Total Score: {best_score.total:.0f}/1000** (Threshold: {cfg.MIN_QUALITY_SCORE:.0f})
 
-| Metric | Score | Details |
-|--------|-------|---------|  
-| Sharpness | {best_score.sharpness:.3f} | Laplacian variance |
-| Frontality | {best_score.frontality:.3f} | Yaw: {best_score.yaw:.1f}°, Pitch: {best_score.pitch:.1f}° |
-| Face Size | {best_score.face_size:.3f} | Relative to frame |
-| Brightness | {best_score.brightness:.3f} | Face ROI mean |
-| Contrast | {best_score.contrast:.3f} | Face ROI std dev |
+| Metric | Value | Importance | Description |
+|--------|-------|------------|-------------|  
+| Frontality | {best_score.frontality:.2f} | {cfg.QUALITY_IMPORTANCE.get('frontality', 8)} | Yaw: {best_score.yaw:.1f}°, Pitch: {best_score.pitch:.1f}° |
+| Sharpness | {best_score.sharpness:.2f} | {cfg.QUALITY_IMPORTANCE.get('sharpness', 6)} | Laplacian variance |
+| Face Size | {best_score.face_size:.2f} | {cfg.QUALITY_IMPORTANCE.get('face_size', 5)} | Relative to frame |
+| Brightness | {best_score.brightness:.2f} | {cfg.QUALITY_IMPORTANCE.get('brightness', 4)} | Face ROI mean |
+| Contrast | {best_score.contrast:.2f} | {cfg.QUALITY_IMPORTANCE.get('contrast', 3)} | Face ROI std dev |
+
+*Scoring: score = 1000 × factor^(importance/5) for each factor*
 
 ---
 
@@ -245,7 +248,7 @@ def generate_debug_report(
         
         md += f"""### Rank #{rank} (Frame {frame_idx})
 
-**Score: {score.total:.3f}** | Sharp: {score.sharpness:.2f} | Frontal: {score.frontality:.2f} | Yaw: {score.yaw:.1f}° | Pitch: {score.pitch:.1f}°
+**Score: {score.total:.0f}/1000** | Frontal: {score.frontality:.2f} | Sharp: {score.sharpness:.2f} | Size: {score.face_size:.2f} | Yaw: {score.yaw:.1f}°
 
 ![Frame {frame_idx}]({b64_img})
 
@@ -322,6 +325,10 @@ def run_visitor_counter(debug_mode: bool = False) -> None:
     
     # Connect to camera
     logger.info("Connecting to camera...")
+    # Use TCP transport for more stable RTSP connection
+    if isinstance(camera_source, str) and camera_source.startswith("rtsp://"):
+        # Set RTSP transport to TCP (more reliable than UDP)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
     cap = cv2.VideoCapture(camera_source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
@@ -420,9 +427,28 @@ def run_visitor_counter(debug_mode: bool = False) -> None:
             timing_stats['scoring'].append(scoring_time)
             session_stats['frames_scored'] += len(scored_frames)
             
-            logger.info(f"Best frame score: {best_score.total:.3f} "
+            logger.info(f"Best frame score: {best_score.total:.0f}/1000 "
                         f"(sharp={best_score.sharpness:.2f}, frontal={best_score.frontality:.2f}, "
-                        f"yaw={best_score.yaw:.1f}°, pitch={best_score.pitch:.1f}°)")
+                        f"size={best_score.face_size:.2f}, yaw={best_score.yaw:.1f}°)")
+            
+            # =================================================================
+            # QUALITY GATE 1: Check minimum quality score
+            # =================================================================
+            if best_score.total < cfg.MIN_QUALITY_SCORE:
+                logger.warning(f"Quality score {best_score.total:.0f} below threshold "
+                              f"{cfg.MIN_QUALITY_SCORE:.0f} - skipping recognition")
+                
+                if debug_mode and scored_frames:
+                    generate_debug_report(
+                        capture=capture,
+                        scored_frames=scored_frames,
+                        best_score=best_score,
+                        visitor_result="LOW_QUALITY",
+                        visitor_id=0
+                    )
+                
+                last_capture_time = time.time()
+                continue
             
             # =================================================================
             # PHASE 4: Extract embedding from best frame
@@ -434,6 +460,17 @@ def run_visitor_counter(debug_mode: bool = False) -> None:
             
             if not face_results:
                 logger.warning("No face found in best frame for embedding extraction")
+                
+                # Still generate debug report for analysis
+                if debug_mode and scored_frames:
+                    generate_debug_report(
+                        capture=capture,
+                        scored_frames=scored_frames,
+                        best_score=best_score,
+                        visitor_result="NO_FACE",
+                        visitor_id=0
+                    )
+                
                 last_capture_time = time.time()
                 continue
             
@@ -441,9 +478,29 @@ def run_visitor_counter(debug_mode: bool = False) -> None:
             embedding, bbox, det_score = face_results[0]
             
             # =================================================================
+            # QUALITY GATE 2: Check InsightFace detection confidence
+            # =================================================================
+            if det_score < cfg.MIN_DETECTION_SCORE:
+                logger.warning(f"Detection confidence {det_score:.3f} below threshold "
+                              f"{cfg.MIN_DETECTION_SCORE} - skipping API call")
+                
+                if debug_mode and scored_frames:
+                    generate_debug_report(
+                        capture=capture,
+                        scored_frames=scored_frames,
+                        best_score=best_score,
+                        visitor_result=f"LOW_CONFIDENCE ({det_score:.2f})",
+                        visitor_id=0
+                    )
+                
+                last_capture_time = time.time()
+                continue
+            
+            # =================================================================
             # PHASE 5: Send to server for identification
             # =================================================================
             # Server performs matching and decides new vs returning
+            logger.debug(f"Detection confidence: {det_score:.3f}")
             api_response = api.identify(embedding, best_frame)
             
             if api_response.success:

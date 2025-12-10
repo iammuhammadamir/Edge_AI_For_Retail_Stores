@@ -28,14 +28,18 @@ QUALITY_CAPTURE_DURATION_SEC: float = 5.0  # How long to capture after face dete
 QUALITY_FRAME_SKIP: int = 3  # Keep every Nth frame during capture
 QUALITY_TOP_N_FRAMES: int = 5  # Number of top frames to show in debug output
 
-# Quality scoring weights (must sum to 1.0)
-QUALITY_WEIGHTS: dict = {
-    'face_size': 0.15,
-    'sharpness': 0.30,
-    'brightness': 0.15,
-    'contrast': 0.15,
-    'frontality': 0.25
+# Quality scoring - Multiplicative penalty system
+# Each factor independently impacts the score via: score × factor^(importance/5)
+# Importance scale: 0 = ignored, 5 = linear penalty, 10 = quadratic penalty
+QUALITY_IMPORTANCE: dict = {
+    'frontality': 8,    # Critical - angled faces match poorly
+    'sharpness': 6,     # Important - blur hurts recognition
+    'face_size': 5,     # Moderate - too small/far is bad
+    'brightness': 4,    # Some tolerance for lighting variation
+    'contrast': 3,      # Lower priority - less critical
 }
+
+QUALITY_BASE_SCORE: float = 1000.0  # Starting score before penalties
 
 # =============================================================================
 # RECOGNITION SETTINGS
@@ -46,6 +50,18 @@ SIMILARITY_THRESHOLD: float = 0.45  # Cosine similarity threshold for matching
                                      # Higher = fewer matches (risk: same person counted twice)
 
 COOLDOWN_SECONDS: int = 10  # Wait time before processing next person
+
+# =============================================================================
+# QUALITY GATE THRESHOLDS (False Positive Prevention)
+# =============================================================================
+
+# Minimum quality score to proceed with recognition (out of 1000)
+# Frames below this are skipped entirely (saves API calls)
+MIN_QUALITY_SCORE: float = 500.0  # 50% of base score
+
+# Minimum InsightFace detection confidence to send to API
+# Lower confidence = less reliable embedding = potential false match
+MIN_DETECTION_SCORE: float = 0.70
 
 # =============================================================================
 # MODEL SETTINGS
